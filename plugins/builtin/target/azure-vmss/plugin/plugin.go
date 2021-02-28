@@ -38,7 +38,7 @@ var (
 
 	pluginInfo = &base.PluginInfo{
 		Name:       pluginName,
-		PluginType: plugins.PluginTypeTarget,
+		PluginType: sdk.PluginTypeTarget,
 	}
 )
 
@@ -50,7 +50,10 @@ type TargetPlugin struct {
 	config       map[string]string
 	logger       hclog.Logger
 	vmss         compute.VirtualMachineScaleSetsClient
-	scaleInUtils *scaleutils.ScaleIn
+
+	// clusterUtils provides general cluster scaling utilities for querying the
+	// state of nodes pools and performing scaling tasks.
+	clusterUtils *scaleutils.ClusterScaleUtils
 }
 
 // NewAzureVMSSPlugin returns the Azure VMSS implementation of the target.Target
@@ -61,7 +64,7 @@ func NewAzureVMSSPlugin(log hclog.Logger) *TargetPlugin {
 	}
 }
 
-// SetConfig satisfies the SetConfig function on the base.Plugin interface.
+// SetConfig satisfies the SetConfig function on the base.Base interface.
 func (t *TargetPlugin) SetConfig(config map[string]string) error {
 
 	t.config = config
@@ -70,16 +73,19 @@ func (t *TargetPlugin) SetConfig(config map[string]string) error {
 		return err
 	}
 
-	utils, err := scaleutils.NewScaleInUtils(nomad.ConfigFromNamespacedMap(config), t.logger)
+	clusterUtils, err := scaleutils.NewClusterScaleUtils(nomad.ConfigFromNamespacedMap(config), t.logger)
 	if err != nil {
 		return err
 	}
-	t.scaleInUtils = utils
+
+	// Store and set the remote ID callback function.
+	t.clusterUtils = clusterUtils
+	t.clusterUtils.ClusterNodeIDLookupFunc = azureNodeIDMap
 
 	return nil
 }
 
-// PluginInfo satisfies the PluginInfo function on the base.Plugin interface.
+// PluginInfo satisfies the PluginInfo function on the base.Base interface.
 func (t *TargetPlugin) PluginInfo() (*base.PluginInfo, error) {
 	return pluginInfo, nil
 }
@@ -135,6 +141,17 @@ func (t *TargetPlugin) Scale(action sdk.ScalingAction, config map[string]string)
 
 // Status satisfies the Status function on the target.Target interface.
 func (t *TargetPlugin) Status(config map[string]string) (*sdk.TargetStatus, error) {
+
+	// Perform our check of the Nomad node pool. If the pool is not ready, we
+	// can exit here and avoid calling the Azure API as it won't affect the
+	// outcome.
+	ready, err := t.clusterUtils.IsPoolReady(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to run Nomad node readiness check: %v", err)
+	}
+	if !ready {
+		return &sdk.TargetStatus{Ready: ready}, nil
+	}
 
 	// We cannot scale an vmss without knowing the vmss resource group and name.
 	resourceGroup, ok := config[configKeyResoureGroup]

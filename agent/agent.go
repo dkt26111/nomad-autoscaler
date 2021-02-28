@@ -23,17 +23,26 @@ import (
 type Agent struct {
 	logger        hclog.Logger
 	config        *config.Agent
+	configPaths   []string
 	nomadClient   *api.Client
 	pluginManager *manager.PluginManager
+	policySources map[policy.SourceName]policy.Source
 	policyManager *policy.Manager
 	inMemSink     *metrics.InmemSink
 	evalBroker    *policyeval.Broker
+
+	// nomadCfg is the merged Nomad API configuration that should be used when
+	// setting up all clients. It is the result of the Nomad api.DefaultConfig
+	// merged with the user specified Nomad config.Nomad.
+	nomadCfg *api.Config
 }
 
-func NewAgent(c *config.Agent, logger hclog.Logger) *Agent {
+func NewAgent(c *config.Agent, configPaths []string, logger hclog.Logger) *Agent {
 	return &Agent{
-		logger: logger,
-		config: c,
+		logger:      logger,
+		config:      c,
+		configPaths: configPaths,
+		nomadCfg:    nomadHelper.MergeDefaultWithAgentConfig(c.Nomad),
 	}
 }
 
@@ -130,7 +139,8 @@ func (a *Agent) setupPolicyManager() chan *sdk.ScalingEvaluation {
 		sources[policy.SourceNameFile] = filePolicy.NewFileSource(a.logger, a.config.Policy.Dir, policyProcessor)
 	}
 
-	a.policyManager = policy.NewManager(a.logger, sources, a.pluginManager, a.config.Telemetry.CollectionInterval)
+	a.policySources = sources
+	a.policyManager = policy.NewManager(a.logger, a.policySources, a.pluginManager, a.config.Telemetry.CollectionInterval)
 
 	return make(chan *sdk.ScalingEvaluation, 10)
 }
@@ -142,55 +152,11 @@ func (a *Agent) stop() {
 	}
 }
 
-// generateNomadClient takes the internal Nomad configuration, translates and
-// merges it into a Nomad API config object and creates a client.
+// generateNomadClient creates a Nomad client for use within the agent.
 func (a *Agent) generateNomadClient() error {
 
-	// Use the Nomad API default config which gets populated by defaults and
-	// also checks for environment variables.
-	cfg := api.DefaultConfig()
-
-	// Merge our top level configuration options in.
-	if a.config.Nomad.Address != "" {
-		cfg.Address = a.config.Nomad.Address
-	}
-	if a.config.Nomad.Region != "" {
-		cfg.Region = a.config.Nomad.Region
-	}
-	if a.config.Nomad.Namespace != "" {
-		cfg.Namespace = a.config.Nomad.Namespace
-	}
-	if a.config.Nomad.Token != "" {
-		cfg.SecretID = a.config.Nomad.Token
-	}
-
-	// Merge HTTP auth.
-	if a.config.Nomad.HTTPAuth != "" {
-		cfg.HttpAuth = nomadHelper.HTTPAuthFromString(a.config.Nomad.HTTPAuth)
-	}
-
-	// Merge TLS.
-	if a.config.Nomad.CACert != "" {
-		cfg.TLSConfig.CACert = a.config.Nomad.CACert
-	}
-	if a.config.Nomad.CAPath != "" {
-		cfg.TLSConfig.CAPath = a.config.Nomad.CAPath
-	}
-	if a.config.Nomad.ClientCert != "" {
-		cfg.TLSConfig.ClientCert = a.config.Nomad.ClientCert
-	}
-	if a.config.Nomad.ClientKey != "" {
-		cfg.TLSConfig.ClientKey = a.config.Nomad.ClientKey
-	}
-	if a.config.Nomad.TLSServerName != "" {
-		cfg.TLSConfig.TLSServerName = a.config.Nomad.TLSServerName
-	}
-	if a.config.Nomad.SkipVerify {
-		cfg.TLSConfig.Insecure = a.config.Nomad.SkipVerify
-	}
-
 	// Generate the Nomad client.
-	client, err := api.NewClient(cfg)
+	client, err := api.NewClient(a.nomadCfg)
 	if err != nil {
 		return fmt.Errorf("failed to instantiate Nomad client: %v", err)
 	}
@@ -202,8 +168,37 @@ func (a *Agent) generateNomadClient() error {
 // reload triggers the reload of sub-routines based on the operator sending a
 // SIGHUP signal to the agent.
 func (a *Agent) reload() {
+	a.logger.Info("reloading Autoscaler configuration")
+
+	// Reload config files from disk.
+	// Exit on error so operators can detect and correct configuration early.
+	// TODO: revisit this once we have a better mechanism for surfacing errors.
+	newCfg, err := config.LoadPaths(a.configPaths)
+	if err != nil {
+		a.logger.Error("failed to reload Autoscaler configuration", "error", err)
+		os.Exit(1)
+	}
+
+	a.config = newCfg
+	a.nomadCfg = nomadHelper.MergeDefaultWithAgentConfig(newCfg.Nomad)
+
+	if err := a.generateNomadClient(); err != nil {
+		a.logger.Error("failed to reload Autoscaler configuration", "error", err)
+		os.Exit(1)
+	}
+
 	a.logger.Debug("reloading policy sources")
+	// Set new Nomad client in the Nomad policy source.
+	ps, ok := a.policySources[policy.SourceNameNomad]
+	if ok {
+		ps.(*nomadPolicy.Source).SetNomadClient(a.nomadClient)
+	}
 	a.policyManager.ReloadSources()
+
+	a.logger.Debug("reloading plugins")
+	if err := a.pluginManager.Reload(a.setupPluginsConfig()); err != nil {
+		a.logger.Error("failed to reload plugins", "error", err)
+	}
 }
 
 // handleSignals blocks until the agent receives an exit signal.

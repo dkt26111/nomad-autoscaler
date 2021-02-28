@@ -40,10 +40,13 @@ var _ target.Target = (*TargetPlugin)(nil)
 
 // TargetPlugin is the OpenStack Senlin implementation of the target.Target interface.
 type TargetPlugin struct {
-	config       map[string]string
-	logger       hclog.Logger
-	client       *gophercloud.ServiceClient
-	scaleInUtils *scaleutils.ScaleIn
+	config map[string]string
+	logger hclog.Logger
+	client *gophercloud.ServiceClient
+
+	// clusterUtils provides general cluster scaling utilities for querying the
+	// state of nodes pools and performing scaling tasks.
+	clusterUtils *scaleutils.ClusterScaleUtils
 }
 
 // NewOSSenlinPlugin returns the OpenStack Senlin implementation of the target.Target
@@ -63,11 +66,14 @@ func (t *TargetPlugin) SetConfig(config map[string]string) error {
 		return err
 	}
 
-	utils, err := scaleutils.NewScaleInUtils(nomad.ConfigFromNamespacedMap(config), t.logger)
+	clusterUtils, err := scaleutils.NewClusterScaleUtils(nomad.ConfigFromNamespacedMap(config), t.logger)
 	if err != nil {
 		return err
 	}
-	t.scaleInUtils = utils
+
+	// Store and set the remote ID callback function.
+	t.clusterUtils = clusterUtils
+	t.clusterUtils.ClusterNodeIDLookupFunc = openstackNodeNameMap
 
 	return nil
 }

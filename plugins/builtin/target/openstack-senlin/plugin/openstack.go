@@ -11,14 +11,18 @@ import (
 	"github.com/gophercloud/gophercloud/openstack/clustering/v1/actions"
 	"github.com/gophercloud/gophercloud/openstack/clustering/v1/clusters"
 	"github.com/gophercloud/gophercloud/openstack/clustering/v1/nodes"
-	"github.com/hashicorp/nomad-autoscaler/sdk"
 	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils"
+	"github.com/hashicorp/nomad/api"
 	"github.com/pkg/errors"
 )
 
 const (
 	defaultRetryInterval = 10 * time.Second
 	defaultRetryLimit    = 15
+
+	// nodeAttrOpenStackHostname is the node attribute to use when identifying the
+	// OpenStack hostname of a node.
+	nodeAttrOpenStackHostname = "unique.hostname"
 )
 
 // setupOSClients takes the passed config mapping and instantiates the
@@ -80,12 +84,7 @@ func (t *TargetPlugin) scaleOut(ctx context.Context, cluster *clusters.Cluster, 
 
 func (t *TargetPlugin) scaleIn(ctx context.Context, cluster *clusters.Cluster, num int64, config map[string]string) error {
 
-	scaleReq, err := t.generateScaleReq(num, config)
-	if err != nil {
-		return fmt.Errorf("failed to generate scale in request: %v", err)
-	}
-
-	ids, err := t.scaleInUtils.RunPreScaleInTasks(ctx, scaleReq)
+	ids, err := t.clusterUtils.RunPreScaleInTasks(ctx, config, int(num))
 	if err != nil {
 		return fmt.Errorf("failed to perform pre-scale Nomad scale in tasks: %v", err)
 	}
@@ -109,52 +108,19 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, cluster *clusters.Cluster, n
 	log.Info("successfully deleted instances from OpenStack Senlin Cluster %s", cluster.Name)
 
 	// Run any post scale in tasks that are desired.
-	if err := t.scaleInUtils.RunPostScaleInTasks(config, ids); err != nil {
+	if err := t.clusterUtils.RunPostScaleInTasks(ctx, config, ids); err != nil {
 		return fmt.Errorf("failed to perform post-scale Nomad scale in tasks: %v", err)
 	}
 
 	return nil
 }
 
-func (t *TargetPlugin) generateScaleReq(num int64, config map[string]string) (*scaleutils.ScaleInReq, error) {
-
-	// Pull the class key from the config mapping. This is a required value and
-	// we cannot scale without this.
-	class, ok := config[sdk.TargetConfigKeyClass]
-	if !ok {
-		return nil, fmt.Errorf("required config param %q not found", sdk.TargetConfigKeyClass)
-	}
-
-	// The drain_deadline is an optional parameter so define out default and
-	// then attempt to find an operator specified value.
-	drain := scaleutils.DefaultDrainDeadline
-
-	if drainString, ok := config[sdk.TargetConfigKeyDrainDeadline]; ok {
-		d, err := time.ParseDuration(drainString)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse %q as time duration", drainString)
-		}
-		drain = d
-	}
-
-	return &scaleutils.ScaleInReq{
-		Num:           int(num),
-		DrainDeadline: drain,
-		PoolIdentifier: &scaleutils.PoolIdentifier{
-			IdentifierKey: scaleutils.IdentifierKeyClass,
-			Value:         class,
-		},
-		RemoteProvider: scaleutils.RemoteProviderOpenStackInstanceName,
-		NodeIDStrategy: scaleutils.IDStrategyNewestCreateIndex,
-	}, nil
-}
-
-func (t *TargetPlugin) getNodeIDs(ids []scaleutils.NodeID) ([]string, error) {
+func (t *TargetPlugin) getNodeIDs(ids []scaleutils.NodeResourceID) ([]string, error) {
 	instanceIDs := []string{}
 
 	for _, n := range ids {
 		nodeOpts := nodes.ListOpts{
-			Name: n.RemoteID,
+			Name: n.RemoteResourceID,
 		}
 
 		allPages, err := nodes.List(t.client, nodeOpts).AllPages()
@@ -251,4 +217,14 @@ func (t *TargetPlugin) ensureActionsComplete(ctx context.Context, ids []string) 
 	}
 
 	return retry(ctx, defaultRetryInterval, defaultRetryLimit, f)
+}
+
+// openstackNodeIDMap is used to identify the OpenStack hostname of a Nomad node using
+// the relevant attribute value.
+func openstackNodeNameMap(n *api.Node) (string, error) {
+	if val, ok := n.Attributes[nodeAttrOpenStackHostname]; ok {
+		return val, nil
+	}
+
+	return "", fmt.Errorf("attribute %q not found", nodeAttrOpenStackHostname)
 }
